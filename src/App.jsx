@@ -119,7 +119,7 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
 
     const materialCost = demand * scrapFactor * sup.unitCost; const tariffs = materialCost * sup.tariffRate * tariffMultiplier;
     const thousandMiles = (distances[`${sup.region.id}-${asm.region.id}`] ?? 2.0);
-    const modeDef = transport[pick.mode];
+    const modeDef = transport[pick.supMode];
     const tonMiles = demand * 0.02 * thousandMiles * 1000; const transportCost = tonMiles * modeDef.costPerTonMi; const carbonKg = tonMiles * modeDef.carbonPerTonMi;
     const assemblyCost = demand * lru.bomLaborHours * laborRate * asm.laborCostMultiplier; const overhead = asm.fixedOverhead * (demand / asm.capacity);
 
@@ -133,7 +133,7 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
     const lruService = clamp(sup.reliability * leadFactor, 0, 1); totals.serviceLevel = Math.min(totals.serviceLevel, lruService);
 
     supplierCounts[sup.id] = (supplierCounts[sup.id] || 0) + demand; supLoad[sup.id] += demand; asmLoad[asm.id] += demand;
-    const regionRisk = sup.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2); const modeRisk = pick.mode === "air" ? 0.02 : pick.mode === "ground" ? 0.04 : 0.06;
+    const regionRisk = sup.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2); const modeRisk = pick.supMode === "air" ? 0.02 : pick.supMode === "ground" ? 0.04 : 0.06;
     totals.riskIndex += (regionRisk + relRisk + modeRisk) * (demand / 10000);
   }
   const totalUnits = Object.values(supplierCounts).reduce((a, b) => a + b, 0) || 1;
@@ -161,10 +161,10 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
 }
 
 function enumerateBestSolution({ network, params, lruEdits }) {
-  const { lrus, suppliers, assemblySites } = network; const modes = ["air", "ground", "ocean"]; let best = null;
+  const { lrus, suppliers, assemblySites, dcs } = network; const modes = ["air", "ground", "ocean"]; let best = null;
   function dfs(idx, currentAssign) {
     if (idx === lrus.length) { const res = evaluateSolution({ assignment: currentAssign, params, network, lruEdits }); if (res.feasible) if (!best || res.objective < best.objective) best = { ...res, assignment: { ...currentAssign } }; return; }
-    const lru = lrus[idx]; for (const s of suppliers) for (const a of assemblySites) for (const m of modes) { currentAssign[lru.id] = { supplierId: s.id, assemblyId: a.id, mode: m }; dfs(idx + 1, currentAssign); }
+    const lru = lrus[idx]; for (const s of suppliers) for (const a of assemblySites) for (const m of modes) { currentAssign[lru.id] = { supplierId: s.id, assemblyId: a.id, dcId: dcs[0].id, supMode: m, dcMode: 'ground' }; dfs(idx + 1, currentAssign); }
   }
   dfs(0, {}); return best;
 }
@@ -188,7 +188,7 @@ function useDrag(position, onChange) {
   return ref;
 }
 
-function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplier, setPendingSupplier }) {
+function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplier, setPendingSupplier, pendingAssembly, setPendingAssembly }) {
   const width = 1000; const height = 520; const nodeW = 140; const nodeH = 36;
   const [positions, setPositions] = useState(() => {
     const p = {}; const xGap = 220;
@@ -199,7 +199,11 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
   });
   function setPos(id, xy) { setPositions((prev) => ({ ...prev, [id]: xy })); }
   function centerOf(id) { const p = positions[id]; return { cx: (p?.x || 0) + nodeW / 2, cy: (p?.y || 0) + nodeH / 2 }; }
-  const edges = Object.entries(assignment).map(([lruId, pick]) => ({ lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.mode }));
+  const edges = [];
+  Object.entries(assignment).forEach(([lruId, pick]) => {
+    if (pick.supplierId && pick.assemblyId) edges.push({ lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.supMode, type: 'sup' });
+    if (pick.assemblyId && pick.dcId) edges.push({ lruId, from: pick.assemblyId, to: pick.dcId, mode: pick.dcMode, type: 'dc' });
+  });
   const modeStyle = { air: { dash: "0", width: 3 }, ground: { dash: "6 6", width: 2.5 }, ocean: { dash: "2 6", width: 2 } };
 
   return (
@@ -210,7 +214,13 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
           <g key={idx}>
             <line x1={a.cx} y1={a.cy} x2={b.cx} y2={b.cy} stroke="#7dd3fc" strokeWidth={modeStyle[e.mode].width} strokeDasharray={modeStyle[e.mode].dash} />
             <rect x={(a.cx + b.cx)/2 - 28} y={(a.cy + b.cy)/2 - 10} width="56" height="18" rx="6" fill="#0b1220" stroke="#1f2937" onClick={() => {
-              setAssignment((prev) => { const cur = prev[e.lruId]; const nextMode = cur.mode === 'air' ? 'ground' : cur.mode === 'ground' ? 'ocean' : 'air'; return { ...prev, [e.lruId]: { ...cur, mode: nextMode } }; });
+              setAssignment(prev => {
+                const cur = prev[e.lruId];
+                const key = e.type === 'sup' ? 'supMode' : 'dcMode';
+                const curMode = cur[key];
+                const nextMode = curMode === 'air' ? 'ground' : curMode === 'ground' ? 'ocean' : 'air';
+                return { ...prev, [e.lruId]: { ...cur, [key]: nextMode } };
+              });
             }} style={{ cursor: 'pointer' }} />
             <text x={(a.cx + b.cx)/2} y={(a.cy + b.cy)/2 + 3} textAnchor="middle" fontSize="10" fill="#e2e8f0">{e.lruId}•{e.mode}</text>
           </g>
@@ -220,14 +230,18 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
           <Node key={n.id} id={n.id} label={(n.name || n.id) + (n.region?` (${n.region.id})`:"")} x={positions[n.id]?.x||0} y={positions[n.id]?.y||0} width={nodeW} height={nodeH}
             onMove={(xy)=> setPos(n.id, xy)}
             onClick={() => {
-              if (n.id.startsWith('S')) { setPendingSupplier(n.id); }
-              if (n.id.startsWith('A') && pendingSupplier) { const sId = pendingSupplier; const aId = n.id; setAssignment((prev)=> ({ ...prev, [activeLruId]: { ...prev[activeLruId], supplierId: sId, assemblyId: aId } })); setPendingSupplier(null); }
+              if (n.id.startsWith('S')) { setPendingSupplier(n.id); setPendingAssembly(null); }
+              if (n.id.startsWith('A')) {
+                if (pendingSupplier) { const sId = pendingSupplier; const aId = n.id; setAssignment(prev => ({ ...prev, [activeLruId]: { ...prev[activeLruId], supplierId: sId, assemblyId: aId } })); setPendingSupplier(null); }
+                else { setPendingAssembly(n.id); }
+              }
+              if (n.id.startsWith('D') && pendingAssembly) { const dId = n.id; setAssignment(prev => ({ ...prev, [activeLruId]: { ...prev[activeLruId], dcId: dId } })); setPendingAssembly(null); }
             }}
-            armed={pendingSupplier && n.id === pendingSupplier}
+            armed={(pendingSupplier && n.id === pendingSupplier) || (pendingAssembly && n.id === pendingAssembly)}
           />
         ))}
       </svg>
-      <div className="absolute top-2 right-2 text-[11px] text-slate-400">Click Supplier then Assembly to connect • Click edge tag to change mode</div>
+      <div className="absolute top-2 right-2 text-[11px] text-slate-400">Click Supplier then Assembly to connect • Click Assembly then DC to connect • Click edge tag to change mode</div>
     </div>
   );
 }
@@ -261,6 +275,7 @@ export default function App() {
   const [lruEdits, setLruEdits] = useState({});
   const [activeLruId, setActiveLruId] = useState(network.lrus[0].id);
   const [pendingSupplier, setPendingSupplier] = useState(null);
+  const [pendingAssembly, setPendingAssembly] = useState(null);
 
   // OEM profile
   const [profileId, setProfileId] = useState("pnc");
@@ -270,7 +285,7 @@ export default function App() {
     setServiceTarget(prof.serviceTarget); setRiskWeight(prof.riskWeight); setCarbonPrice(prof.carbonPrice); setTariffMultiplier(prof.tariffMultiplier);
   }
 
-  useEffect(() => { const esc=(e)=>{ if(e.key==='Escape') setPendingSupplier(null); }; window.addEventListener('keydown', esc); return ()=> window.removeEventListener('keydown', esc); }, []);
+  useEffect(() => { const esc=(e)=>{ if(e.key==='Escape') { setPendingSupplier(null); setPendingAssembly(null); } }; window.addEventListener('keydown', esc); return ()=> window.removeEventListener('keydown', esc); }, []);
 
   // Derived demand multiplier by scenario & variant
   const demandMultiplier = useMemo(() => {
@@ -281,7 +296,7 @@ export default function App() {
   const params = useMemo(() => ({ serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow }), [serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow]);
 
   // Assignment (default)
-  const [assignment, setAssignment] = useState(() => { const base = {}; network.lrus.forEach((l, i) => { base[l.id] = { supplierId: network.suppliers[i % network.suppliers.length].id, assemblyId: network.assemblySites[i % network.assemblySites.length].id, mode: 'ground' }; }); return base; });
+  const [assignment, setAssignment] = useState(() => { const base = {}; network.lrus.forEach((l, i) => { base[l.id] = { supplierId: network.suppliers[i % network.suppliers.length].id, assemblyId: network.assemblySites[i % network.assemblySites.length].id, dcId: network.dcs[i % network.dcs.length].id, supMode: 'ground', dcMode: 'ground' }; }); return base; });
 
   // Import from share link (no deprecated escape/unescape)
   useEffect(() => {
@@ -479,23 +494,23 @@ export default function App() {
             </div>
           )}
 
-          <Panel title="Network & Flows" subtitle="Pick Active LRU, click Supplier then Assembly to connect. Click edge tag to cycle mode.">
+          <Panel title="Network & Flows" subtitle="Pick Active LRU, click Supplier then Assembly, then Assembly then DC to connect. Click edge tag to cycle modes.">
             <div className="flex items-center gap-2 mb-2 text-xs">
               <span className="text-slate-400">Active LRU</span>
               <select className="bg-slate-800 text-slate-100 text-xs rounded-lg px-2 py-1 border border-slate-700" value={activeLruId} onChange={(e) => setActiveLruId(e.target.value)}>
                 {network.lrus.map((l) => <option key={l.id} value={l.id}>{l.name}</option>)}
               </select>
-              {pendingSupplier && <span className="text-amber-400">Supplier selected… pick an Assembly or press ESC</span>}
+              {pendingSupplier ? <span className="text-amber-400">Supplier selected… pick an Assembly or press ESC</span> : pendingAssembly ? <span className="text-amber-400">Assembly selected… pick a DC or press ESC</span> : null}
             </div>
             <div className="rounded-xl overflow-hidden border border-slate-800">
-              <Graph network={network} assignment={assignment} setAssignment={setAssignment} activeLruId={activeLruId} pendingSupplier={pendingSupplier} setPendingSupplier={setPendingSupplier} />
+              <Graph network={network} assignment={assignment} setAssignment={setAssignment} activeLruId={activeLruId} pendingSupplier={pendingSupplier} setPendingSupplier={setPendingSupplier} pendingAssembly={pendingAssembly} setPendingAssembly={setPendingAssembly} />
             </div>
             <div className="mt-3 grid grid-cols-3 gap-2">
               {network.lrus.map((l) => (
                 <div key={l.id} className="p-2 rounded-lg bg-slate-900 border border-slate-800">
                   <div className="text-xs text-slate-300 flex justify-between items-center">
                     <span>{l.name}</span>
-                    <span className="text-[10px] text-slate-500">{assignment[l.id].supplierId}→{assignment[l.id].assemblyId} • {assignment[l.id].mode}</span>
+                    <span className="text-[10px] text-slate-500">{assignment[l.id].supplierId}→{assignment[l.id].assemblyId}→{assignment[l.id].dcId} • {assignment[l.id].supMode}/{assignment[l.id].dcMode}</span>
                   </div>
                   <div className="mt-2 grid grid-cols-3 gap-1">
                     <NumberInput label="Base Demand" value={(lruEdits[l.id]?.baseDemand ?? l.baseDemand)} onChange={(v) => setLruEdits((p)=>({ ...p, [l.id]: { ...(p[l.id]||{}), baseDemand: v } }))} min={1000} max={30000} step={100} />
@@ -646,7 +661,7 @@ export default function App() {
           <div className="font-semibold mb-1">How to use</div>
           <ul className="list-disc ml-5 space-y-1 text-slate-400">
             <li>Select an OEM profile, scenario, and variant; tune targets & prices; toggle overflow policy.</li>
-            <li>Pick an Active LRU, then click Supplier and Assembly to assign. Click edge tag to cycle mode.</li>
+            <li>Pick an Active LRU, then click Supplier and Assembly, then Assembly and DC to assign. Click edge tag to cycle modes.</li>
             <li>Run Optimize (local or remote) to meet service at lowest objective under constraints.</li>
             <li>Use Monte Carlo for uncertainty; Sensitivity for most impactful levers; Compare for deltas.</li>
             <li>Save scenarios, export JSON, share a URL, or Export PDF (print) for execs.</li>
