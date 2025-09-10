@@ -101,40 +101,53 @@ function computeLoads(network, assignment, demandMultiplier, lruEdits) {
  * Core calculations (capacity & overflow, per-site penalty)
  ********************/
 function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
-  const { suppliers, assemblySites, transport, distances } = network;
+  const { suppliers, assemblySites, dcs, transport, distances } = network;
   const supMap = Object.fromEntries(suppliers.map((s) => [s.id, s]));
   const asmMap = Object.fromEntries(assemblySites.map((a) => [a.id, a]));
+  const dcMap = Object.fromEntries(dcs.map((d) => [d.id, d]));
   const lrus = effectiveLrus(network.lrus, lruEdits);
   const { serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow } = params;
 
   let totals = { units: 0, material: 0, tariffs: 0, transportCost: 0, assembly: 0, overhead: 0, inventory: 0, carbonKg: 0, riskIndex: 0, serviceLevel: 1 };
-  const supplierCounts = {}; const supLoad = Object.fromEntries(suppliers.map((s) => [s.id, 0])); const asmLoad = Object.fromEntries(assemblySites.map((a) => [a.id, 0]));
+  const supplierCounts = {};
+  const supLoad = Object.fromEntries(suppliers.map((s) => [s.id, 0]));
+  const asmLoad = Object.fromEntries(assemblySites.map((a) => [a.id, 0]));
+  const dcLoad = Object.fromEntries(dcs.map((d) => [d.id, 0]));
   // per-site cost accumulation for accurate penalties and bottlenecks
   const matBySup = Object.fromEntries(suppliers.map((s) => [s.id, 0]));
   const asmCostBySite = Object.fromEntries(assemblySites.map((a) => [a.id, 0]));
+  const dcTransBySite = Object.fromEntries(dcs.map((d) => [d.id, 0]));
 
   for (const lru of lrus) {
     const pick = assignment[lru.id]; const sup = supMap[pick.supplierId]; const asm = asmMap[pick.assemblyId];
+    const dc = dcMap[pick.dcId || dcs[0].id]; const dcMode = pick.dcMode || pick.mode;
     const demand = Math.round(lru.baseDemand * demandMultiplier); const scrapFactor = 1 + lru.bomScrapRate;
 
     const materialCost = demand * scrapFactor * sup.unitCost; const tariffs = materialCost * sup.tariffRate * tariffMultiplier;
     const thousandMiles = (distances[`${sup.region.id}-${asm.region.id}`] ?? 2.0);
     const modeDef = transport[pick.mode];
     const tonMiles = demand * 0.02 * thousandMiles * 1000; const transportCost = tonMiles * modeDef.costPerTonMi; const carbonKg = tonMiles * modeDef.carbonPerTonMi;
+
+    const thousandMiles2 = (distances[`${asm.region.id}-${dc.region.id}`] ?? 2.0);
+    const modeDef2 = transport[dcMode];
+    const tonMiles2 = demand * 0.02 * thousandMiles2 * 1000; const transportCost2 = tonMiles2 * modeDef2.costPerTonMi; const carbonKg2 = tonMiles2 * modeDef2.carbonPerTonMi;
+
     const assemblyCost = demand * lru.bomLaborHours * laborRate * asm.laborCostMultiplier; const overhead = asm.fixedOverhead * (demand / asm.capacity);
 
-    const cogs = materialCost + tariffs + assemblyCost + overhead + transportCost; const inventory = cogs * inventoryCarryPct;
+    const cogs = materialCost + tariffs + assemblyCost + overhead + transportCost + transportCost2; const inventory = cogs * inventoryCarryPct;
 
-    totals.units += demand; totals.material += materialCost; totals.tariffs += tariffs; totals.transportCost += transportCost; totals.assembly += assemblyCost; totals.overhead += overhead; totals.inventory += inventory; totals.carbonKg += carbonKg;
+    totals.units += demand; totals.material += materialCost; totals.tariffs += tariffs; totals.transportCost += transportCost + transportCost2; totals.assembly += assemblyCost; totals.overhead += overhead; totals.inventory += inventory; totals.carbonKg += carbonKg + carbonKg2;
 
-    matBySup[sup.id] += materialCost; asmCostBySite[asm.id] += assemblyCost;
+    matBySup[sup.id] += materialCost; asmCostBySite[asm.id] += assemblyCost; dcTransBySite[dc.id] += transportCost2;
 
-    const leadFactor = clamp(1 - Math.max(0, (sup.leadTimeDays + modeDef.leadPenaltyDays - 20)) / 60, 0.7, 1);
+    const leadFactor = clamp(1 - Math.max(0, (sup.leadTimeDays + modeDef.leadPenaltyDays + modeDef2.leadPenaltyDays - 20)) / 60, 0.7, 1);
     const lruService = clamp(sup.reliability * leadFactor, 0, 1); totals.serviceLevel = Math.min(totals.serviceLevel, lruService);
 
-    supplierCounts[sup.id] = (supplierCounts[sup.id] || 0) + demand; supLoad[sup.id] += demand; asmLoad[asm.id] += demand;
-    const regionRisk = sup.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2); const modeRisk = pick.mode === "air" ? 0.02 : pick.mode === "ground" ? 0.04 : 0.06;
-    totals.riskIndex += (regionRisk + relRisk + modeRisk) * (demand / 10000);
+    supplierCounts[sup.id] = (supplierCounts[sup.id] || 0) + demand; supLoad[sup.id] += demand; asmLoad[asm.id] += demand; dcLoad[dc.id] += demand;
+    const regionRisk = sup.region.risk + dc.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2);
+    const modeRisk1 = pick.mode === "air" ? 0.02 : pick.mode === "ground" ? 0.04 : 0.06;
+    const modeRisk2 = dcMode === "air" ? 0.02 : dcMode === "ground" ? 0.04 : 0.06;
+    totals.riskIndex += (regionRisk + relRisk + modeRisk1 + modeRisk2) * (demand / 10000);
   }
   const totalUnits = Object.values(supplierCounts).reduce((a, b) => a + b, 0) || 1;
   const hhi = Object.values(supplierCounts).reduce((acc, u) => acc + Math.pow(u / totalUnits, 2), 0); totals.riskIndex += hhi * 0.5;
@@ -143,21 +156,27 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
   let overflowPenalty = 0; let serviceDegrade = 0;
   for (const s of suppliers) {
     const load = supLoad[s.id]; if (load > s.capacity) {
-      const ratio = (load - s.capacity) / load; if (!allowOverflow) return { totals, cost: Infinity, feasible: false, objective: Infinity, capacity: { supLoad, asmLoad, matBySup, asmCostBySite } };
+      const ratio = (load - s.capacity) / load; if (!allowOverflow) return { totals, cost: Infinity, feasible: false, objective: Infinity, capacity: { supLoad, asmLoad, dcLoad, matBySup, asmCostBySite, dcTransBySite } };
       overflowPenalty += matBySup[s.id] * ratio * 0.20; serviceDegrade = Math.max(serviceDegrade, 0.03 * ratio * 5);
     }
   }
   for (const a of assemblySites) {
     const load = asmLoad[a.id]; if (load > a.capacity) {
-      const ratio = (load - a.capacity) / load; if (!allowOverflow) return { totals, cost: Infinity, feasible: false, objective: Infinity, capacity: { supLoad, asmLoad, matBySup, asmCostBySite } };
+      const ratio = (load - a.capacity) / load; if (!allowOverflow) return { totals, cost: Infinity, feasible: false, objective: Infinity, capacity: { supLoad, asmLoad, dcLoad, matBySup, asmCostBySite, dcTransBySite } };
       overflowPenalty += asmCostBySite[a.id] * ratio * 0.30; serviceDegrade = Math.max(serviceDegrade, 0.04 * ratio * 5);
+    }
+  }
+  for (const d of dcs) {
+    const cap = d.capacity; const load = dcLoad[d.id]; if (cap && load > cap) {
+      const ratio = (load - cap) / load; if (!allowOverflow) return { totals, cost: Infinity, feasible: false, objective: Infinity, capacity: { supLoad, asmLoad, dcLoad, matBySup, asmCostBySite, dcTransBySite } };
+      overflowPenalty += dcTransBySite[d.id] * ratio * 0.10; serviceDegrade = Math.max(serviceDegrade, 0.02 * ratio * 5);
     }
   }
   if (serviceDegrade > 0) totals.serviceLevel = clamp(totals.serviceLevel * (1 - serviceDegrade), 0, 1);
 
   const cost = totals.material + totals.tariffs + totals.transportCost + totals.assembly + totals.overhead + totals.inventory + totals.carbonKg * carbonPrice + overflowPenalty;
   const feasible = totals.serviceLevel >= serviceTarget && cost < Infinity; const objective = cost + riskWeight * totals.riskIndex * 1_000_000;
-  return { totals, cost, feasible, objective, capacity: { supLoad, asmLoad, matBySup, asmCostBySite } };
+  return { totals, cost, feasible, objective, capacity: { supLoad, asmLoad, dcLoad, matBySup, asmCostBySite, dcTransBySite } };
 }
 
 function enumerateBestSolution({ network, params, lruEdits }) {
