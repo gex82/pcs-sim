@@ -39,7 +39,10 @@ function generateMockNetwork(seed = 42) {
     { id: "A1", name: "Assembly East", region: regions[0], laborCostMultiplier: 1.0, fixedOverhead: 1_000_000, capacity: 15000 },
     { id: "A2", name: "Assembly West", region: regions[0], laborCostMultiplier: 0.95, fixedOverhead: 900_000, capacity: 14000 },
   ];
-  const dcs = [ { id: "D1", name: "DC East", region: regions[0] }, { id: "D2", name: "DC West", region: regions[0] } ];
+  const dcs = [
+    { id: "D1", name: "DC East", region: regions[0], capacity: 16000 },
+    { id: "D2", name: "DC West", region: regions[0], capacity: 15000 },
+  ];
   const lrus = [
     { id: "L1", name: "LRU-Avionics", baseDemand: 8000, bomLaborHours: 2.4, bomScrapRate: 0.02 },
     { id: "L2", name: "LRU-Power Unit", baseDemand: 6500, bomLaborHours: 3.1, bomScrapRate: 0.03 },
@@ -85,16 +88,19 @@ function computeLoads(network, assignment, demandMultiplier, lruEdits) {
   const lrusEff = effectiveLrus(network.lrus, lruEdits);
   const supplierLoad = Object.fromEntries(network.suppliers.map((s) => [s.id, 0]));
   const assemblyLoad = Object.fromEntries(network.assemblySites.map((a) => [a.id, 0]));
+  const dcLoad = Object.fromEntries(network.dcs.map((d) => [d.id, 0]));
   for (const l of lrusEff) {
     const dem = Math.round(l.baseDemand * demandMultiplier);
     const pick = assignment[l.id];
     if (!pick) continue;
     supplierLoad[pick.supplierId] += dem;
     assemblyLoad[pick.assemblyId] += dem;
+    if (pick.dcId) dcLoad[pick.dcId] += dem;
   }
   const supplierUtil = network.suppliers.map((s) => ({ id: s.id, name: s.name, load: supplierLoad[s.id], cap: s.capacity, util: supplierLoad[s.id] / s.capacity }));
   const assemblyUtil = network.assemblySites.map((a) => ({ id: a.id, name: a.name, load: assemblyLoad[a.id], cap: a.capacity, util: assemblyLoad[a.id] / a.capacity }));
-  return { supplierUtil, assemblyUtil };
+  const dcUtil = network.dcs.map((d) => ({ id: d.id, name: d.name, load: dcLoad[d.id], cap: d.capacity, util: dcLoad[d.id] / (d.capacity || Infinity) }));
+  return { supplierUtil, assemblyUtil, dcUtil };
 }
 
 /********************
@@ -281,14 +287,34 @@ export default function App() {
   const params = useMemo(() => ({ serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow }), [serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow]);
 
   // Assignment (default)
-  const [assignment, setAssignment] = useState(() => { const base = {}; network.lrus.forEach((l, i) => { base[l.id] = { supplierId: network.suppliers[i % network.suppliers.length].id, assemblyId: network.assemblySites[i % network.assemblySites.length].id, mode: 'ground' }; }); return base; });
+  const [assignment, setAssignment] = useState(() => {
+    const base = {};
+    network.lrus.forEach((l, i) => {
+      base[l.id] = {
+        supplierId: network.suppliers[i % network.suppliers.length].id,
+        assemblyId: network.assemblySites[i % network.assemblySites.length].id,
+        dcId: network.dcs[i % network.dcs.length].id,
+        mode: 'ground',
+      };
+    });
+    return base;
+  });
 
   // Import from share link (no deprecated escape/unescape)
   useEffect(() => {
     try {
       if (location.hash && location.hash.length > 1) {
         const decoded = JSON.parse(decodeURIComponent(atob(location.hash.slice(1))));
-        if (decoded.assignment) setAssignment(decoded.assignment);
+        if (decoded.assignment) {
+          const merged = {};
+          network.lrus.forEach((l) => {
+            merged[l.id] = {
+              dcId: decoded.assignment[l.id]?.dcId ?? network.dcs[0].id,
+              ...decoded.assignment[l.id],
+            };
+          });
+          setAssignment(merged);
+        }
         if (decoded.params) {
           const p = decoded.params; setServiceTarget(p.serviceTarget ?? 0.95); setLaborRate(p.laborRate ?? 75); setTariffMultiplier(p.tariffMultiplier ?? 1.0); setCarbonPrice(p.carbonPrice ?? 0.02); setInventoryCarryPct(p.inventoryCarryPct ?? 0.12); setRiskWeight(p.riskWeight ?? 0.4); setAllowOverflow(p.allowOverflow ?? true);
         }
@@ -304,6 +330,13 @@ export default function App() {
   const [optBusy, setOptBusy] = useState(false);
   const [useRemote, setUseRemote] = useState(false);
   const [remoteUrl, setRemoteUrl] = useState("https://<your-worker>.workers.dev/optimize");
+  function mergeDc(assign) {
+    const merged = {};
+    network.lrus.forEach((l) => {
+      merged[l.id] = { dcId: assignment[l.id]?.dcId ?? network.dcs[0].id, ...assign[l.id] };
+    });
+    return merged;
+  }
   async function runOptimize() {
     setOptBusy(true);
     try {
@@ -312,13 +345,23 @@ export default function App() {
         const res = await fetch(remoteUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         if (res.ok) {
           const data = await res.json();
-          const bestAssign = data.assignment || data.bestAssignment; if (bestAssign) setAssignment(bestAssign); else { const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment); }
-        } else { const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment); }
+          const bestAssign = data.assignment || data.bestAssignment;
+          if (bestAssign) setAssignment(mergeDc(bestAssign));
+          else {
+            const best = enumerateBestSolution({ network, params, lruEdits });
+            if (best) setAssignment(mergeDc(best.assignment));
+          }
+        } else {
+          const best = enumerateBestSolution({ network, params, lruEdits });
+          if (best) setAssignment(mergeDc(best.assignment));
+        }
       } else {
-        const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment);
+        const best = enumerateBestSolution({ network, params, lruEdits });
+        if (best) setAssignment(mergeDc(best.assignment));
       }
     } catch {
-      const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment);
+      const best = enumerateBestSolution({ network, params, lruEdits });
+      if (best) setAssignment(mergeDc(best.assignment));
     } finally { setOptBusy(false); }
   }
 
@@ -508,7 +551,7 @@ export default function App() {
           </Panel>
 
           <Panel title="Capacity Utilization & Bottlenecks">
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <div>
                 <div className="text-xs text-slate-400 mb-1">Suppliers</div>
                 {loads.supplierUtil.map((s) => <UtilRow key={s.id} name={s.name} load={s.load} cap={s.cap} />)}
@@ -517,13 +560,18 @@ export default function App() {
                 <div className="text-xs text-slate-400 mb-1">Assembly</div>
                 {loads.assemblyUtil.map((a) => <UtilRow key={a.id} name={a.name} load={a.load} cap={a.cap} />)}
               </div>
+              <div>
+                <div className="text-xs text-slate-400 mb-1">DCs</div>
+                {loads.dcUtil.map((d) => <UtilRow key={d.id} name={d.name} load={d.load} cap={d.cap} />)}
+              </div>
             </div>
             <div className="mt-3 text-[12px] text-slate-300">
               <div className="mb-1 text-slate-400">Bottlenecks (util ≥ 85%)</div>
               <div className="grid grid-cols-3 gap-2">
                 {[
                   ...loads.supplierUtil.map(s=>({type:'Supplier', ...s})),
-                  ...loads.assemblyUtil.map(a=>({type:'Assembly', ...a}))
+                  ...loads.assemblyUtil.map(a=>({type:'Assembly', ...a})),
+                  ...loads.dcUtil.map(d=>({type:'DC', ...d}))
                 ].filter(x=>x.util>=0.85).sort((a,b)=>b.util-a.util).map(x=> (
                   <div key={`${x.type}-${x.id}`} className="p-2 rounded bg-slate-800 border border-slate-700">
                     <div className="flex justify-between"><span>{x.type}: {x.name}</span><span>{Math.round(x.util*100)}%</span></div>
@@ -532,7 +580,8 @@ export default function App() {
                 ))}
                 {[
                   ...loads.supplierUtil.map(s=>s.util),
-                  ...loads.assemblyUtil.map(a=>a.util)
+                  ...loads.assemblyUtil.map(a=>a.util),
+                  ...loads.dcUtil.map(d=>d.util)
                 ].every(u=>u<0.85) && <div className="text-slate-500">No bottlenecks.</div>}
               </div>
             </div>
