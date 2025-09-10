@@ -248,10 +248,13 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
   });
   function setPos(id, xy) { setPositions((prev) => ({ ...prev, [id]: xy })); }
   function centerOf(id) { const p = positions[id]; return { cx: (p?.x || 0) + nodeW / 2, cy: (p?.y || 0) + nodeH / 2 }; }
-  const edges = Object.entries(assignment).flatMap(([lruId, pick]) => [
-    { lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.supMode, kind: 'sup' },
-    { lruId, from: pick.assemblyId, to: pick.dcId, mode: pick.dcMode, kind: 'dc' },
-  ]);
+  const edges = [];
+  Object.entries(assignment).forEach(([lruId, pick]) => {
+    if (pick.supplierId && pick.assemblyId)
+      edges.push({ lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.supMode, kind: 'sup' });
+    if (pick.assemblyId && pick.dcId)
+      edges.push({ lruId, from: pick.assemblyId, to: pick.dcId, mode: pick.dcMode, kind: 'dc' });
+  });
   const modeStyle = { air: { dash: "0", width: 3 }, ground: { dash: "6 6", width: 2.5 }, ocean: { dash: "2 6", width: 2 } };
 
   return (
