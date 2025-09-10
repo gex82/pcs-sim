@@ -97,13 +97,29 @@ function computeLoads(network, assignment, demandMultiplier, lruEdits) {
   return { supplierUtil, assemblyUtil };
 }
 
+function normalizeAssignment(raw, network) {
+  const defaultDc = network.dcs[0]?.id;
+  const converted = {};
+  for (const [lruId, pick] of Object.entries(raw || {})) {
+    converted[lruId] = {
+      supplierId: pick.supplierId,
+      assemblyId: pick.assemblyId,
+      dcId: pick.dcId ?? defaultDc,
+      supMode: pick.supMode ?? pick.mode ?? 'ground',
+      dcMode: pick.dcMode ?? pick.mode ?? 'ground',
+    };
+  }
+  return converted;
+}
+
 /********************
  * Core calculations (capacity & overflow, per-site penalty)
  ********************/
 function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
-  const { suppliers, assemblySites, transport, distances } = network;
+  const { suppliers, assemblySites, dcs, transport, distances } = network;
   const supMap = Object.fromEntries(suppliers.map((s) => [s.id, s]));
   const asmMap = Object.fromEntries(assemblySites.map((a) => [a.id, a]));
+  const dcMap = Object.fromEntries(dcs.map((d) => [d.id, d]));
   const lrus = effectiveLrus(network.lrus, lruEdits);
   const { serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow } = params;
 
@@ -114,27 +130,60 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
   const asmCostBySite = Object.fromEntries(assemblySites.map((a) => [a.id, 0]));
 
   for (const lru of lrus) {
-    const pick = assignment[lru.id]; const sup = supMap[pick.supplierId]; const asm = asmMap[pick.assemblyId];
-    const demand = Math.round(lru.baseDemand * demandMultiplier); const scrapFactor = 1 + lru.bomScrapRate;
+    const pick = assignment[lru.id];
+    const sup = supMap[pick.supplierId];
+    const asm = asmMap[pick.assemblyId];
+    const dc = dcMap[pick.dcId];
+    const demand = Math.round(lru.baseDemand * demandMultiplier);
+    const scrapFactor = 1 + lru.bomScrapRate;
 
-    const materialCost = demand * scrapFactor * sup.unitCost; const tariffs = materialCost * sup.tariffRate * tariffMultiplier;
-    const thousandMiles = (distances[`${sup.region.id}-${asm.region.id}`] ?? 2.0);
-    const modeDef = transport[pick.mode];
-    const tonMiles = demand * 0.02 * thousandMiles * 1000; const transportCost = tonMiles * modeDef.costPerTonMi; const carbonKg = tonMiles * modeDef.carbonPerTonMi;
-    const assemblyCost = demand * lru.bomLaborHours * laborRate * asm.laborCostMultiplier; const overhead = asm.fixedOverhead * (demand / asm.capacity);
+    const materialCost = demand * scrapFactor * sup.unitCost;
+    const tariffs = materialCost * sup.tariffRate * tariffMultiplier;
 
-    const cogs = materialCost + tariffs + assemblyCost + overhead + transportCost; const inventory = cogs * inventoryCarryPct;
+    const thousandMilesSup = (distances[`${sup.region.id}-${asm.region.id}`] ?? 2.0);
+    const supModeDef = transport[pick.supMode];
+    const tonMilesSup = demand * 0.02 * thousandMilesSup * 1000;
+    const transportCostSup = tonMilesSup * supModeDef.costPerTonMi;
+    const carbonKgSup = tonMilesSup * supModeDef.carbonPerTonMi;
 
-    totals.units += demand; totals.material += materialCost; totals.tariffs += tariffs; totals.transportCost += transportCost; totals.assembly += assemblyCost; totals.overhead += overhead; totals.inventory += inventory; totals.carbonKg += carbonKg;
+    const thousandMilesDc = (distances[`${asm.region.id}-${dc.region.id}`] ?? 2.0);
+    const dcModeDef = transport[pick.dcMode];
+    const tonMilesDc = demand * 0.02 * thousandMilesDc * 1000;
+    const transportCostDc = tonMilesDc * dcModeDef.costPerTonMi;
+    const carbonKgDc = tonMilesDc * dcModeDef.carbonPerTonMi;
 
-    matBySup[sup.id] += materialCost; asmCostBySite[asm.id] += assemblyCost;
+    const transportCost = transportCostSup + transportCostDc;
+    const carbonKg = carbonKgSup + carbonKgDc;
+    const assemblyCost = demand * lru.bomLaborHours * laborRate * asm.laborCostMultiplier;
+    const overhead = asm.fixedOverhead * (demand / asm.capacity);
 
-    const leadFactor = clamp(1 - Math.max(0, (sup.leadTimeDays + modeDef.leadPenaltyDays - 20)) / 60, 0.7, 1);
-    const lruService = clamp(sup.reliability * leadFactor, 0, 1); totals.serviceLevel = Math.min(totals.serviceLevel, lruService);
+    const cogs = materialCost + tariffs + assemblyCost + overhead + transportCost;
+    const inventory = cogs * inventoryCarryPct;
 
-    supplierCounts[sup.id] = (supplierCounts[sup.id] || 0) + demand; supLoad[sup.id] += demand; asmLoad[asm.id] += demand;
-    const regionRisk = sup.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2); const modeRisk = pick.mode === "air" ? 0.02 : pick.mode === "ground" ? 0.04 : 0.06;
-    totals.riskIndex += (regionRisk + relRisk + modeRisk) * (demand / 10000);
+    totals.units += demand;
+    totals.material += materialCost;
+    totals.tariffs += tariffs;
+    totals.transportCost += transportCost;
+    totals.assembly += assemblyCost;
+    totals.overhead += overhead;
+    totals.inventory += inventory;
+    totals.carbonKg += carbonKg;
+
+    matBySup[sup.id] += materialCost;
+    asmCostBySite[asm.id] += assemblyCost;
+
+    const leadFactor = clamp(1 - Math.max(0, (sup.leadTimeDays + supModeDef.leadPenaltyDays - 20)) / 60, 0.7, 1);
+    const lruService = clamp(sup.reliability * leadFactor, 0, 1);
+    totals.serviceLevel = Math.min(totals.serviceLevel, lruService);
+
+    supplierCounts[sup.id] = (supplierCounts[sup.id] || 0) + demand;
+    supLoad[sup.id] += demand;
+    asmLoad[asm.id] += demand;
+    const regionRisk = sup.region.risk;
+    const relRisk = clamp(1 - sup.reliability, 0, 0.2);
+    const modeRiskSup = pick.supMode === "air" ? 0.02 : pick.supMode === "ground" ? 0.04 : 0.06;
+    const modeRiskDc = pick.dcMode === "air" ? 0.02 : pick.dcMode === "ground" ? 0.04 : 0.06;
+    totals.riskIndex += (regionRisk + relRisk + (modeRiskSup + modeRiskDc) / 2) * (demand / 10000);
   }
   const totalUnits = Object.values(supplierCounts).reduce((a, b) => a + b, 0) || 1;
   const hhi = Object.values(supplierCounts).reduce((acc, u) => acc + Math.pow(u / totalUnits, 2), 0); totals.riskIndex += hhi * 0.5;
@@ -161,12 +210,27 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
 }
 
 function enumerateBestSolution({ network, params, lruEdits }) {
-  const { lrus, suppliers, assemblySites } = network; const modes = ["air", "ground", "ocean"]; let best = null;
+  const { lrus, suppliers, assemblySites, dcs } = network;
+  const modes = ["air", "ground", "ocean"];
+  let best = null;
   function dfs(idx, currentAssign) {
-    if (idx === lrus.length) { const res = evaluateSolution({ assignment: currentAssign, params, network, lruEdits }); if (res.feasible) if (!best || res.objective < best.objective) best = { ...res, assignment: { ...currentAssign } }; return; }
-    const lru = lrus[idx]; for (const s of suppliers) for (const a of assemblySites) for (const m of modes) { currentAssign[lru.id] = { supplierId: s.id, assemblyId: a.id, mode: m }; dfs(idx + 1, currentAssign); }
+    if (idx === lrus.length) {
+      const res = evaluateSolution({ assignment: currentAssign, params, network, lruEdits });
+      if (res.feasible) if (!best || res.objective < best.objective) best = { ...res, assignment: { ...currentAssign } };
+      return;
+    }
+    const lru = lrus[idx];
+    for (const s of suppliers)
+      for (const a of assemblySites)
+        for (const d of dcs)
+          for (const m1 of modes)
+            for (const m2 of modes) {
+              currentAssign[lru.id] = { supplierId: s.id, assemblyId: a.id, dcId: d.id, supMode: m1, dcMode: m2 };
+              dfs(idx + 1, currentAssign);
+            }
   }
-  dfs(0, {}); return best;
+  dfs(0, {});
+  return best;
 }
 
 /********************
@@ -199,7 +263,10 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
   });
   function setPos(id, xy) { setPositions((prev) => ({ ...prev, [id]: xy })); }
   function centerOf(id) { const p = positions[id]; return { cx: (p?.x || 0) + nodeW / 2, cy: (p?.y || 0) + nodeH / 2 }; }
-  const edges = Object.entries(assignment).map(([lruId, pick]) => ({ lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.mode }));
+  const edges = Object.entries(assignment).flatMap(([lruId, pick]) => [
+    { lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.supMode, kind: 'sup' },
+    { lruId, from: pick.assemblyId, to: pick.dcId, mode: pick.dcMode, kind: 'dc' },
+  ]);
   const modeStyle = { air: { dash: "0", width: 3 }, ground: { dash: "6 6", width: 2.5 }, ocean: { dash: "2 6", width: 2 } };
 
   return (
@@ -210,7 +277,13 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
           <g key={idx}>
             <line x1={a.cx} y1={a.cy} x2={b.cx} y2={b.cy} stroke="#7dd3fc" strokeWidth={modeStyle[e.mode].width} strokeDasharray={modeStyle[e.mode].dash} />
             <rect x={(a.cx + b.cx)/2 - 28} y={(a.cy + b.cy)/2 - 10} width="56" height="18" rx="6" fill="#0b1220" stroke="#1f2937" onClick={() => {
-              setAssignment((prev) => { const cur = prev[e.lruId]; const nextMode = cur.mode === 'air' ? 'ground' : cur.mode === 'ground' ? 'ocean' : 'air'; return { ...prev, [e.lruId]: { ...cur, mode: nextMode } }; });
+              setAssignment((prev) => {
+                const cur = prev[e.lruId];
+                const field = e.kind === 'sup' ? 'supMode' : 'dcMode';
+                const current = cur[field];
+                const nextMode = current === 'air' ? 'ground' : current === 'ground' ? 'ocean' : 'air';
+                return { ...prev, [e.lruId]: { ...cur, [field]: nextMode } };
+              });
             }} style={{ cursor: 'pointer' }} />
             <text x={(a.cx + b.cx)/2} y={(a.cy + b.cy)/2 + 3} textAnchor="middle" fontSize="10" fill="#e2e8f0">{e.lruId}•{e.mode}</text>
           </g>
@@ -281,14 +354,26 @@ export default function App() {
   const params = useMemo(() => ({ serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow }), [serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow]);
 
   // Assignment (default)
-  const [assignment, setAssignment] = useState(() => { const base = {}; network.lrus.forEach((l, i) => { base[l.id] = { supplierId: network.suppliers[i % network.suppliers.length].id, assemblyId: network.assemblySites[i % network.assemblySites.length].id, mode: 'ground' }; }); return base; });
+  const [assignment, setAssignment] = useState(() => {
+    const base = {};
+    network.lrus.forEach((l, i) => {
+      base[l.id] = {
+        supplierId: network.suppliers[i % network.suppliers.length].id,
+        assemblyId: network.assemblySites[i % network.assemblySites.length].id,
+        dcId: network.dcs[i % network.dcs.length].id,
+        supMode: 'ground',
+        dcMode: 'ground',
+      };
+    });
+    return base;
+  });
 
   // Import from share link (no deprecated escape/unescape)
   useEffect(() => {
     try {
       if (location.hash && location.hash.length > 1) {
         const decoded = JSON.parse(decodeURIComponent(atob(location.hash.slice(1))));
-        if (decoded.assignment) setAssignment(decoded.assignment);
+        if (decoded.assignment) setAssignment(normalizeAssignment(decoded.assignment, network));
         if (decoded.params) {
           const p = decoded.params; setServiceTarget(p.serviceTarget ?? 0.95); setLaborRate(p.laborRate ?? 75); setTariffMultiplier(p.tariffMultiplier ?? 1.0); setCarbonPrice(p.carbonPrice ?? 0.02); setInventoryCarryPct(p.inventoryCarryPct ?? 0.12); setRiskWeight(p.riskWeight ?? 0.4); setAllowOverflow(p.allowOverflow ?? true);
         }
@@ -312,7 +397,9 @@ export default function App() {
         const res = await fetch(remoteUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
         if (res.ok) {
           const data = await res.json();
-          const bestAssign = data.assignment || data.bestAssignment; if (bestAssign) setAssignment(bestAssign); else { const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment); }
+          const bestAssign = data.assignment || data.bestAssignment;
+          if (bestAssign) setAssignment(normalizeAssignment(bestAssign, network));
+          else { const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment); }
         } else { const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment); }
       } else {
         const best = enumerateBestSolution({ network, params, lruEdits }); if (best) setAssignment(best.assignment);
@@ -458,7 +545,7 @@ export default function App() {
                   <div key={s.id} className="p-2 rounded-lg bg-slate-800/60 border border-slate-700">
                     <div className="text-xs text-slate-300 flex justify-between">
                       <span>{s.master} • {s.variant}</span>
-                      <button className="text-indigo-400 hover:text-indigo-300" onClick={() => { setAssignment(s.assignment); setLruEdits(s.lruEdits||{}); applyProfile(s.profileId||'pnc'); }}>
+                      <button className="text-indigo-400 hover:text-indigo-300" onClick={() => { setAssignment(normalizeAssignment(s.assignment, network)); setLruEdits(s.lruEdits||{}); applyProfile(s.profileId||'pnc'); }}>
                         Load
                       </button>
                     </div>
@@ -495,7 +582,7 @@ export default function App() {
                 <div key={l.id} className="p-2 rounded-lg bg-slate-900 border border-slate-800">
                   <div className="text-xs text-slate-300 flex justify-between items-center">
                     <span>{l.name}</span>
-                    <span className="text-[10px] text-slate-500">{assignment[l.id].supplierId}→{assignment[l.id].assemblyId} • {assignment[l.id].mode}</span>
+                    <span className="text-[10px] text-slate-500">{assignment[l.id].supplierId}→{assignment[l.id].assemblyId}→{assignment[l.id].dcId} • {assignment[l.id].supMode}/{assignment[l.id].dcMode}</span>
                   </div>
                   <div className="mt-2 grid grid-cols-3 gap-1">
                     <NumberInput label="Base Demand" value={(lruEdits[l.id]?.baseDemand ?? l.baseDemand)} onChange={(v) => setLruEdits((p)=>({ ...p, [l.id]: { ...(p[l.id]||{}), baseDemand: v } }))} min={1000} max={30000} step={100} />
