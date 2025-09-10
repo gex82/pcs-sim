@@ -101,9 +101,10 @@ function computeLoads(network, assignment, demandMultiplier, lruEdits) {
  * Core calculations (capacity & overflow, per-site penalty)
  ********************/
 function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
-  const { suppliers, assemblySites, transport, distances } = network;
+  const { suppliers, assemblySites, dcs, transport, distances } = network;
   const supMap = Object.fromEntries(suppliers.map((s) => [s.id, s]));
   const asmMap = Object.fromEntries(assemblySites.map((a) => [a.id, a]));
+  const dcMap = Object.fromEntries(dcs.map((d) => [d.id, d]));
   const lrus = effectiveLrus(network.lrus, lruEdits);
   const { serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow } = params;
 
@@ -114,13 +115,24 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
   const asmCostBySite = Object.fromEntries(assemblySites.map((a) => [a.id, 0]));
 
   for (const lru of lrus) {
-    const pick = assignment[lru.id]; const sup = supMap[pick.supplierId]; const asm = asmMap[pick.assemblyId];
+    const pick = assignment[lru.id]; const sup = supMap[pick.supplierId]; const asm = asmMap[pick.assemblyId]; const dc = dcMap[pick.dcId];
     const demand = Math.round(lru.baseDemand * demandMultiplier); const scrapFactor = 1 + lru.bomScrapRate;
 
     const materialCost = demand * scrapFactor * sup.unitCost; const tariffs = materialCost * sup.tariffRate * tariffMultiplier;
-    const thousandMiles = (distances[`${sup.region.id}-${asm.region.id}`] ?? 2.0);
-    const modeDef = transport[pick.mode];
-    const tonMiles = demand * 0.02 * thousandMiles * 1000; const transportCost = tonMiles * modeDef.costPerTonMi; const carbonKg = tonMiles * modeDef.carbonPerTonMi;
+    const thousandMilesSup = (distances[`${sup.region.id}-${asm.region.id}`] ?? 2.0);
+    const supModeDef = transport[pick.supMode];
+    const tonMilesSup = demand * 0.02 * thousandMilesSup * 1000;
+    const supTransportCost = tonMilesSup * supModeDef.costPerTonMi;
+    const supCarbonKg = tonMilesSup * supModeDef.carbonPerTonMi;
+
+    const thousandMilesDc = (distances[`${asm.region.id}-${dc.region.id}`] ?? 2.0);
+    const dcModeDef = transport[pick.dcMode];
+    const tonMilesDc = demand * 0.02 * thousandMilesDc * 1000;
+    const dcTransportCost = tonMilesDc * dcModeDef.costPerTonMi;
+    const dcCarbonKg = tonMilesDc * dcModeDef.carbonPerTonMi;
+
+    const transportCost = supTransportCost + dcTransportCost;
+    const carbonKg = supCarbonKg + dcCarbonKg;
     const assemblyCost = demand * lru.bomLaborHours * laborRate * asm.laborCostMultiplier; const overhead = asm.fixedOverhead * (demand / asm.capacity);
 
     const cogs = materialCost + tariffs + assemblyCost + overhead + transportCost; const inventory = cogs * inventoryCarryPct;
@@ -129,12 +141,14 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
 
     matBySup[sup.id] += materialCost; asmCostBySite[asm.id] += assemblyCost;
 
-    const leadFactor = clamp(1 - Math.max(0, (sup.leadTimeDays + modeDef.leadPenaltyDays - 20)) / 60, 0.7, 1);
+    const leadFactor = clamp(1 - Math.max(0, (sup.leadTimeDays + supModeDef.leadPenaltyDays + dcModeDef.leadPenaltyDays - 20)) / 60, 0.7, 1);
     const lruService = clamp(sup.reliability * leadFactor, 0, 1); totals.serviceLevel = Math.min(totals.serviceLevel, lruService);
 
     supplierCounts[sup.id] = (supplierCounts[sup.id] || 0) + demand; supLoad[sup.id] += demand; asmLoad[asm.id] += demand;
-    const regionRisk = sup.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2); const modeRisk = pick.mode === "air" ? 0.02 : pick.mode === "ground" ? 0.04 : 0.06;
-    totals.riskIndex += (regionRisk + relRisk + modeRisk) * (demand / 10000);
+    const regionRisk = sup.region.risk; const relRisk = clamp(1 - sup.reliability, 0, 0.2);
+    const modeRiskSup = pick.supMode === "air" ? 0.02 : pick.supMode === "ground" ? 0.04 : 0.06;
+    const modeRiskDc = pick.dcMode === "air" ? 0.02 : pick.dcMode === "ground" ? 0.04 : 0.06;
+    totals.riskIndex += (regionRisk + relRisk + modeRiskSup + modeRiskDc) * (demand / 10000);
   }
   const totalUnits = Object.values(supplierCounts).reduce((a, b) => a + b, 0) || 1;
   const hhi = Object.values(supplierCounts).reduce((acc, u) => acc + Math.pow(u / totalUnits, 2), 0); totals.riskIndex += hhi * 0.5;
@@ -161,12 +175,28 @@ function evaluateSolution({ assignment, params, network, lruEdits = {} }) {
 }
 
 function enumerateBestSolution({ network, params, lruEdits }) {
-  const { lrus, suppliers, assemblySites } = network; const modes = ["air", "ground", "ocean"]; let best = null;
+  const { lrus, suppliers, assemblySites, dcs } = network;
+  const supModes = ["air", "ground", "ocean"];
+  const dcModes = ["air", "ground", "ocean"];
+  let best = null;
   function dfs(idx, currentAssign) {
-    if (idx === lrus.length) { const res = evaluateSolution({ assignment: currentAssign, params, network, lruEdits }); if (res.feasible) if (!best || res.objective < best.objective) best = { ...res, assignment: { ...currentAssign } }; return; }
-    const lru = lrus[idx]; for (const s of suppliers) for (const a of assemblySites) for (const m of modes) { currentAssign[lru.id] = { supplierId: s.id, assemblyId: a.id, mode: m }; dfs(idx + 1, currentAssign); }
+    if (idx === lrus.length) {
+      const res = evaluateSolution({ assignment: currentAssign, params, network, lruEdits });
+      if (res.feasible) if (!best || res.objective < best.objective) best = { ...res, assignment: { ...currentAssign } };
+      return;
+    }
+    const lru = lrus[idx];
+    for (const s of suppliers)
+      for (const a of assemblySites)
+        for (const d of dcs)
+          for (const sm of supModes)
+            for (const dm of dcModes) {
+              currentAssign[lru.id] = { supplierId: s.id, assemblyId: a.id, dcId: d.id, supMode: sm, dcMode: dm };
+              dfs(idx + 1, currentAssign);
+            }
   }
-  dfs(0, {}); return best;
+  dfs(0, {});
+  return best;
 }
 
 /********************
@@ -199,7 +229,10 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
   });
   function setPos(id, xy) { setPositions((prev) => ({ ...prev, [id]: xy })); }
   function centerOf(id) { const p = positions[id]; return { cx: (p?.x || 0) + nodeW / 2, cy: (p?.y || 0) + nodeH / 2 }; }
-  const edges = Object.entries(assignment).map(([lruId, pick]) => ({ lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.mode }));
+  const edges = Object.entries(assignment).flatMap(([lruId, pick]) => ([
+    { lruId, from: pick.supplierId, to: pick.assemblyId, mode: pick.supMode, leg: 'sup' },
+    { lruId, from: pick.assemblyId, to: pick.dcId, mode: pick.dcMode, leg: 'dc' }
+  ]));
   const modeStyle = { air: { dash: "0", width: 3 }, ground: { dash: "6 6", width: 2.5 }, ocean: { dash: "2 6", width: 2 } };
 
   return (
@@ -210,7 +243,16 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
           <g key={idx}>
             <line x1={a.cx} y1={a.cy} x2={b.cx} y2={b.cy} stroke="#7dd3fc" strokeWidth={modeStyle[e.mode].width} strokeDasharray={modeStyle[e.mode].dash} />
             <rect x={(a.cx + b.cx)/2 - 28} y={(a.cy + b.cy)/2 - 10} width="56" height="18" rx="6" fill="#0b1220" stroke="#1f2937" onClick={() => {
-              setAssignment((prev) => { const cur = prev[e.lruId]; const nextMode = cur.mode === 'air' ? 'ground' : cur.mode === 'ground' ? 'ocean' : 'air'; return { ...prev, [e.lruId]: { ...cur, mode: nextMode } }; });
+              setAssignment((prev) => {
+                const cur = prev[e.lruId];
+                if (e.leg === 'sup') {
+                  const nextMode = cur.supMode === 'air' ? 'ground' : cur.supMode === 'ground' ? 'ocean' : 'air';
+                  return { ...prev, [e.lruId]: { ...cur, supMode: nextMode } };
+                } else {
+                  const nextMode = cur.dcMode === 'air' ? 'ground' : cur.dcMode === 'ground' ? 'ocean' : 'air';
+                  return { ...prev, [e.lruId]: { ...cur, dcMode: nextMode } };
+                }
+              });
             }} style={{ cursor: 'pointer' }} />
             <text x={(a.cx + b.cx)/2} y={(a.cy + b.cy)/2 + 3} textAnchor="middle" fontSize="10" fill="#e2e8f0">{e.lruId}•{e.mode}</text>
           </g>
@@ -227,7 +269,7 @@ function Graph({ network, assignment, setAssignment, activeLruId, pendingSupplie
           />
         ))}
       </svg>
-      <div className="absolute top-2 right-2 text-[11px] text-slate-400">Click Supplier then Assembly to connect • Click edge tag to change mode</div>
+      <div className="absolute top-2 right-2 text-[11px] text-slate-400">Click Supplier then Assembly to connect • Click edge tag to change modes</div>
     </div>
   );
 }
@@ -281,7 +323,7 @@ export default function App() {
   const params = useMemo(() => ({ serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow }), [serviceTarget, laborRate, tariffMultiplier, carbonPrice, inventoryCarryPct, riskWeight, demandMultiplier, allowOverflow]);
 
   // Assignment (default)
-  const [assignment, setAssignment] = useState(() => { const base = {}; network.lrus.forEach((l, i) => { base[l.id] = { supplierId: network.suppliers[i % network.suppliers.length].id, assemblyId: network.assemblySites[i % network.assemblySites.length].id, mode: 'ground' }; }); return base; });
+  const [assignment, setAssignment] = useState(() => { const base = {}; network.lrus.forEach((l, i) => { base[l.id] = { supplierId: network.suppliers[i % network.suppliers.length].id, assemblyId: network.assemblySites[i % network.assemblySites.length].id, dcId: network.dcs[i % network.dcs.length].id, supMode: 'ground', dcMode: 'ground' }; }); return base; });
 
   // Import from share link (no deprecated escape/unescape)
   useEffect(() => {
@@ -479,7 +521,7 @@ export default function App() {
             </div>
           )}
 
-          <Panel title="Network & Flows" subtitle="Pick Active LRU, click Supplier then Assembly to connect. Click edge tag to cycle mode.">
+          <Panel title="Network & Flows" subtitle="Pick Active LRU, click Supplier then Assembly to connect. Click edge tag to cycle modes.">
             <div className="flex items-center gap-2 mb-2 text-xs">
               <span className="text-slate-400">Active LRU</span>
               <select className="bg-slate-800 text-slate-100 text-xs rounded-lg px-2 py-1 border border-slate-700" value={activeLruId} onChange={(e) => setActiveLruId(e.target.value)}>
@@ -495,7 +537,7 @@ export default function App() {
                 <div key={l.id} className="p-2 rounded-lg bg-slate-900 border border-slate-800">
                   <div className="text-xs text-slate-300 flex justify-between items-center">
                     <span>{l.name}</span>
-                    <span className="text-[10px] text-slate-500">{assignment[l.id].supplierId}→{assignment[l.id].assemblyId} • {assignment[l.id].mode}</span>
+                    <span className="text-[10px] text-slate-500">{assignment[l.id].supplierId}→{assignment[l.id].assemblyId}→{assignment[l.id].dcId} • {assignment[l.id].supMode}/{assignment[l.id].dcMode}</span>
                   </div>
                   <div className="mt-2 grid grid-cols-3 gap-1">
                     <NumberInput label="Base Demand" value={(lruEdits[l.id]?.baseDemand ?? l.baseDemand)} onChange={(v) => setLruEdits((p)=>({ ...p, [l.id]: { ...(p[l.id]||{}), baseDemand: v } }))} min={1000} max={30000} step={100} />
@@ -646,7 +688,7 @@ export default function App() {
           <div className="font-semibold mb-1">How to use</div>
           <ul className="list-disc ml-5 space-y-1 text-slate-400">
             <li>Select an OEM profile, scenario, and variant; tune targets & prices; toggle overflow policy.</li>
-            <li>Pick an Active LRU, then click Supplier and Assembly to assign. Click edge tag to cycle mode.</li>
+            <li>Pick an Active LRU, then click Supplier and Assembly to assign. Click edge tag to cycle modes.</li>
             <li>Run Optimize (local or remote) to meet service at lowest objective under constraints.</li>
             <li>Use Monte Carlo for uncertainty; Sensitivity for most impactful levers; Compare for deltas.</li>
             <li>Save scenarios, export JSON, share a URL, or Export PDF (print) for execs.</li>
@@ -655,7 +697,7 @@ export default function App() {
         <div className="col-span-6 text-sm text-slate-400">
           <div className="font-semibold text-slate-300 mb-1">Assumptions & Notes</div>
           <ul className="list-disc ml-5 space-y-1">
-            <li>Illustrative single-period model; service ≈ reliability × lead factor; risk blends region, reliability, mode, HHI.</li>
+            <li>Illustrative single-period model; service ≈ reliability × lead factor; risk blends region, reliability, modes, HHI.</li>
             <li>Capacity overflow adds surcharges & service degradation unless disallowed (then infeasible).</li>
             <li>Remote optimize endpoint is a mock API for demo; swap in true solver later.</li>
           </ul>
